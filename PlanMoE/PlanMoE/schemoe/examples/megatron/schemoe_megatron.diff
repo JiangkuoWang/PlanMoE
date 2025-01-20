@@ -1,0 +1,119 @@
+diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
+index eeeb1e3d..0c754477 100644
+--- a/megatron/core/transformer/transformer_layer.py
++++ b/megatron/core/transformer/transformer_layer.py
+@@ -324,7 +324,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
+         pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+ 
+         # MLP.
+-        mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
++        from megatron.training import get_args
++        args = get_args()
++        if args.schemoe:
++            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output), None
++        else:
++            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+ 
+         # TODO: could we move `bias_dropout_add_exec_handler` itself
+         # inside the module provided in the `bias_dropout_add_spec` module?
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 0217d71e..7abb9d0f 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -1277,6 +1277,18 @@ def _add_training_args(parser):
+                        help='Disables the Reduce-Scatter overlap with fprop GEMM.',
+                        dest='tp_comm_split_rs')
+ 
++    # add arguments
++    group.add_argument('--schemoe', action='store_true',
++                       help='Use ScheMoE')
++    group.add_argument('--schemoe-overlap-degree', type=int, default=1,
++                       help='ScheMoE a2a overlap degree')
++    group.add_argument('--schemoe-compress-name', type=str, default='no',
++                       choices=['no', 'zfp', 'int8'],
++                       help='ScheMoE compression name')
++    group.add_argument('--schemoe-comm-name', type=str, default='naive',
++                       choices=['naive', 'pipe', 'dd', 'hetu'],
++                       help='ScheMoE communication name')
++
+     return parser
+ 
+ 
+diff --git a/megatron/training/schemoe_moe_decorator.py b/megatron/training/schemoe_moe_decorator.py
+new file mode 100644
+index 00000000..d7bfb5b9
+--- /dev/null
++++ b/megatron/training/schemoe_moe_decorator.py
+@@ -0,0 +1,55 @@
++from megatron.training import get_args
++import torch.nn.functional as F
++from schemoe.moe import moe_layer
++import torch.distributed as dist
++from .utils import print_rank_0
++
++def schmoe_moe(args, idx):
++    hidden_size = args.hidden_size
++    ffn_hidden_size = args.ffn_hidden_size
++    world_size = dist.get_world_size()
++    num_experts = args.num_experts
++    if args.moe_expert_capacity_factor is not None and args.moe_expert_capacity_factor > 0:
++        capacity_factor = args.moe_expert_capacity_factor
++    else:
++        capacity_factor = 0.0
++    print_rank_0(f"ScheMoE capacity factor: {capacity_factor}")
++    expert_per_node = num_experts // world_size
++    top_k = args.moe_router_topk
++    activation = F.gelu
++    compress_name = args.schemoe_compress_name
++    comm_name = args.schemoe_comm_name
++    overlap_degree = args.schemoe_overlap_degree
++    moe_ffn = moe_layer(
++        gate_type={
++            'type' : 'top', 'k' : top_k, 'capacity_factor': capacity_factor,
++            'fp32_gate': True, 'gate_noise': 1.0
++        },
++        model_dim=hidden_size,
++        experts={
++            'count_per_node': expert_per_node,'type': 'ffn', 
++            'hidden_size_per_expert': ffn_hidden_size,
++            'activation_fn' : lambda x: activation(x)
++        },
++        a2a_ffn_overlap_degree = overlap_degree,
++        compress_name = compress_name,
++        comm_name = comm_name,
++        scan_expert_func = lambda name, param: setattr(param, 'allreduce', False),
++    )
++    return moe_ffn
++
++
++def schemoe_model_provider(model_provider):
++    args = get_args()
++    def schemoe_model(pre_process=True, post_process=True):
++        model = model_provider()
++       
++        # for idx, l in enumerate(model.language_model.encoder.layers):
++        for idx, l in enumerate(model.decoder.layers):
++            l.mlp = schmoe_moe(args, idx)
++        
++        print_rank_0(f'ScheMoE model:\n{model}')
++        return model
++
++    return schemoe_model
++
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 5556bb26..9df4c9a5 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -269,6 +269,12 @@ def pretrain(
+     args = get_args()
+     timers = get_timers()
+ 
++    # Use ScheMoE
++    if args.schemoe:
++        from .schemoe_moe_decorator import schemoe_model_provider
++        print_rank_0(f"Use ScheMoE Model")
++        model_provider = schemoe_model_provider(model_provider)
++
+     # Track E2E metrics on pretrain start
+     one_logger_utils.on_pretrain_start()
+ 
